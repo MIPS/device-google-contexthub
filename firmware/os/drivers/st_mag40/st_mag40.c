@@ -45,6 +45,7 @@
 #define ST_MAG40_WAI_REG_VAL       0x40
 
 #define ST_MAG40_CFG_A_REG_ADDR    0x60
+#define ST_MAG40_TEMP_COMP_EN      0x80
 #define ST_MAG40_SOFT_RESET_BIT    0x20
 #define ST_MAG40_ODR_10_HZ         0x00
 #define ST_MAG40_ODR_20_HZ         0x04
@@ -63,6 +64,9 @@
 #define ST_MAG40_INT_MAG           0x01
 
 #define ST_MAG40_OUTXL_REG_ADDR    0x68
+
+/* Enable auto-increment of the I2C subaddress (to allow I2C multiple ops) */
+#define ST_MAG40_I2C_AUTO_INCR     0x80
 
 enum st_mag40_SensorEvents
 {
@@ -371,7 +375,7 @@ static void i2c_read(uint8_t addr, uint16_t len, uint32_t delay, bool last)
     if (xfer != NULL) {
         xfer->delay = delay;
         xfer->last = last;
-        xfer->txrxBuf[0] = 0x80 | addr;
+        xfer->txrxBuf[0] = ST_MAG40_I2C_AUTO_INCR | addr;
         i2cMasterTxRx(ST_MAG40_I2C_BUS_ID, ST_MAG40_I2C_ADDR, xfer->txrxBuf, 1, xfer->txrxBuf, len, i2cCallback, xfer);
     }
 }
@@ -598,8 +602,7 @@ static void magTestHandling(struct I2cTransfer *xfer)
                 sendTestResult(SENSOR_APP_EVT_STATUS_ERROR, SENS_TYPE_MAG);
 
         mTask.mag_test_state = MAG_SELFTEST_DONE;
-        mTask.comm_tx(ST_MAG40_CFG_A_REG_ADDR, ST_MAG40_POWER_IDLE, 0, false);
-        mTask.comm_tx(ST_MAG40_CFG_B_REG_ADDR, ST_MAG40_OFF_CANC, 0, false);
+        mTask.comm_tx(ST_MAG40_CFG_A_REG_ADDR, ST_MAG40_TEMP_COMP_EN | ST_MAG40_POWER_IDLE, 0, false);
         mTask.comm_tx(ST_MAG40_CFG_C_REG_ADDR, ST_MAG40_BDU_ON | ST_MAG40_INT_MAG, 0, true);
         break;
 
@@ -766,7 +769,7 @@ static void sensorMagConfig(void)
     case CONFIG_POWER_UP:
         mTask.subState = CONFIG_POWER_UP_2;
         mTask.comm_tx(ST_MAG40_CFG_A_REG_ADDR,
-                      ST_MAG40_POWER_ON | mTask.currentODR, 0, true);
+                      ST_MAG40_TEMP_COMP_EN | ST_MAG40_POWER_ON | mTask.currentODR, 0, true);
         break;
 
     case CONFIG_POWER_UP_2:
@@ -779,7 +782,7 @@ static void sensorMagConfig(void)
     case CONFIG_POWER_DOWN:
         mTask.subState = CONFIG_POWER_DOWN_2;
         mTask.comm_tx(ST_MAG40_CFG_A_REG_ADDR,
-                      ST_MAG40_POWER_IDLE | mTask.currentODR, 0, true);
+                      ST_MAG40_TEMP_COMP_EN | ST_MAG40_POWER_IDLE | mTask.currentODR, 0, true);
         break;
 
     case CONFIG_POWER_DOWN_2:
@@ -793,7 +796,7 @@ static void sensorMagConfig(void)
         mTask.subState = CONFIG_SET_RATE_2;
         tmp = mTask.magOn ? ST_MAG40_POWER_ON : ST_MAG40_POWER_IDLE;
         tmp |= mTask.currentODR;
-        mTask.comm_tx(ST_MAG40_CFG_A_REG_ADDR, tmp, 0, true);
+        mTask.comm_tx(ST_MAG40_CFG_A_REG_ADDR, ST_MAG40_TEMP_COMP_EN | tmp, 0, true);
         break;
 
     case CONFIG_SET_RATE_2:
@@ -822,7 +825,6 @@ static void sensorInit(void)
 
     case INIT_ENABLE_DRDY:
         mTask.subState = INIT_DONE;
-        mTask.comm_tx(ST_MAG40_CFG_B_REG_ADDR, ST_MAG40_OFF_CANC, 0, false);
         mTask.comm_tx(ST_MAG40_CFG_C_REG_ADDR,
                     ST_MAG40_BDU_ON | ST_MAG40_INT_MAG, 0, true);
         break;
@@ -919,10 +921,13 @@ static void handleEvent(uint32_t evtType, const void* evtData)
     switch (evtType) {
     case EVT_APP_START:
         INFO_PRINT("EVT_APP_START\n");
-        SET_STATE(SENSOR_BOOT);
         osEventUnsubscribe(mTask.tid, EVT_APP_START);
 
-        /* fall through */
+        SET_STATE(SENSOR_BOOT);
+        mTask.comm_tx(ST_MAG40_CFG_A_REG_ADDR,
+                        ST_MAG40_SOFT_RESET_BIT, 0, true);
+
+        break;
 
     case EVT_COMM_DONE:
         handleCommDoneEvt(evtData);

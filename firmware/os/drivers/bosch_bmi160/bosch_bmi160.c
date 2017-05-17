@@ -18,10 +18,12 @@
 #include <algos/time_sync.h>
 #include <atomic.h>
 #include <cpu/cpuMath.h>
+#include <errno.h>
 #include <gpio.h>
 #include <heap.h>
 #include <halIntf.h>
 #include <hostIntf.h>
+#include <i2c.h>
 #include <isr.h>
 #include <nanohub_math.h>
 #include <nanohubPacket.h>
@@ -113,6 +115,17 @@
 
 #define BMI160_APP_ID APP_ID_MAKE(NANOHUB_VENDOR_GOOGLE, 2)
 
+#ifdef BMI160_I2C_BUS_ID
+#define BMI160_USE_I2C
+
+#ifndef BMI160_I2C_SPEED
+#define BMI160_I2C_SPEED          400000
+#endif
+#ifndef BMI160_I2C_ADDR
+#define BMI160_I2C_ADDR           0x68
+#endif
+#endif
+
 #define BMI160_SPI_WRITE          0x00
 #define BMI160_SPI_READ           0x80
 
@@ -120,9 +133,18 @@
 #define BMI160_SPI_SPEED_HZ       8000000
 #define BMI160_SPI_MODE           3
 
-#define BMI160_INT_IRQ            EXTI9_5_IRQn
+#ifndef BMI160_INT1_IRQ
+#define BMI160_INT1_IRQ           EXTI9_5_IRQn
+#endif
+#ifndef BMI160_INT1_PIN
 #define BMI160_INT1_PIN           GPIO_PB(6)
+#endif
+#ifndef BMI160_INT2_IRQ
+#define BMI160_INT2_IRQ           EXTI9_5_IRQn
+#endif
+#ifndef BMI160_INT2_PIN
 #define BMI160_INT2_PIN           GPIO_PB(7)
+#endif
 
 #define BMI160_ID                 0xd1
 
@@ -233,7 +255,20 @@
 
 #define MAX_NUM_COMMS_EVENT_SAMPLES 15
 
-#define kScale_acc    0.00239501953f  // ACC_range * 9.81f / 32768.0f;
+// Default accel range is 8g
+#ifndef BMI160_ACC_RANGE_G
+#define BMI160_ACC_RANGE_G 8
+#endif
+
+#if BMI160_ACC_RANGE_G == 16
+#define ACC_RANGE_SETTING 0x0c
+#elif BMI160_ACC_RANGE_G == 8
+#define ACC_RANGE_SETTING 0x08
+#else
+#error "Invalid BMI160_ACC_RANGE_G setting: valid values are 8, 16"
+#endif
+
+#define kScale_acc    (9.81f * BMI160_ACC_RANGE_G / 32768.0f)
 #define kScale_gyr    0.00053263221f  // GYR_range * M_PI / (180.0f * 32768.0f);
 #define kScale_temp   0.001953125f    // temperature in deg C
 #define kTempInvalid  -1000.0f
@@ -455,6 +490,8 @@ struct BMI160Task {
     struct SpiDevice *spiDev;
     struct Gpio *Int1;
     struct Gpio *Int2;
+    IRQn_Type Irq1;
+    IRQn_Type Irq2;
     struct ChainedIsr Isr1;
     struct ChainedIsr Isr2;
 #ifdef ACCEL_CAL_ENABLED
@@ -521,6 +558,11 @@ struct BMI160Task {
     struct SlabAllocator *mDataSlab;
     uint16_t mWbufCnt;
     uint8_t mRegCnt;
+#ifdef BMI160_USE_I2C
+    uint8_t cReg;
+    SpiCbkF sCallback;
+#endif
+
     uint8_t mRetryLeft;
     bool spiInUse;
 };
@@ -798,6 +840,10 @@ static void spiQueueRead(uint8_t addr, size_t size, uint8_t **buf, uint32_t dela
     T(mRegCnt)++;
 }
 
+#ifdef BMI160_USE_I2C
+static void i2cBatchTxRx(void *evtData, int err);
+#endif
+
 static void spiBatchTxRx(struct SpiMode *mode,
         SpiCbkF callback, void *cookie, const char * src)
 {
@@ -812,16 +858,22 @@ static void spiBatchTxRx(struct SpiMode *mode,
     }
 
     T(spiInUse) = true;
+    T(mWbufCnt) = 0;
 
+#ifdef BMI160_USE_I2C
+    T(cReg) = 0;
+    T(sCallback) = callback;
+    i2cBatchTxRx(cookie, 0);
+#else
     // Reset variables before issuing SPI transaction.
     // SPI may finish before spiMasterRxTx finish
     uint8_t regCount = T(mRegCnt);
     T(mRegCnt) = 0;
-    T(mWbufCnt) = 0;
 
     if (spiMasterRxTx(T(spiDev), T(cs), T(packets), regCount, mode, callback, cookie) < 0) {
         ERROR_PRINT("spiMasterRxTx failed!\n");
     }
+#endif
 }
 
 
@@ -949,18 +1001,18 @@ static bool stepCntFirmwareUpload(void *cookie)
     return true;
 }
 
-static bool enableInterrupt(struct Gpio *pin, struct ChainedIsr *isr)
+static bool enableInterrupt(struct Gpio *pin, IRQn_Type irq, struct ChainedIsr *isr)
 {
     gpioConfigInput(pin, GPIO_SPEED_LOW, GPIO_PULL_NONE);
     syscfgSetExtiPort(pin);
     extiEnableIntGpio(pin, EXTI_TRIGGER_RISING);
-    extiChainIsr(BMI160_INT_IRQ, isr);
+    extiChainIsr(irq, isr);
     return true;
 }
 
-static bool disableInterrupt(struct Gpio *pin, struct ChainedIsr *isr)
+static bool disableInterrupt(struct Gpio *pin, IRQn_Type irq, struct ChainedIsr *isr)
 {
-    extiUnchainIsr(BMI160_INT_IRQ, isr);
+    extiUnchainIsr(irq, isr);
     extiDisableIntGpio(pin);
     return true;
 }
@@ -1517,9 +1569,15 @@ static uint8_t computeOdr(uint32_t rate)
 }
 
 static void configMotion(uint8_t odr) {
+#if BMI160_ACC_RANGE_G == 16
+    // motion threshold is element * 31.25mg (for 16g range)
+    static const uint8_t motion_thresholds[ACC_MAX_RATE+1] =
+        {3, 3, 3, 3, 3, 3, 3, 3, 2, 2, 1, 1, 1};
+#elif BMI160_ACC_RANGE_G == 8
     // motion threshold is element * 15.63mg (for 8g range)
     static const uint8_t motion_thresholds[ACC_MAX_RATE+1] =
         {5, 5, 5, 5, 5, 5, 5, 5, 4, 3, 2, 2, 2};
+#endif
 
     // set any_motion duration to 1 point
     // set no_motion duration to (3+1)*1.28sec=5.12sec
@@ -2664,8 +2722,8 @@ static void accCalibrationHandling(void)
         break;
     case CALIBRATION_FOC:
 
-        // set accel range to +-8g
-        SPI_WRITE(BMI160_REG_ACC_RANGE, 0x08);
+        // set accel range
+        SPI_WRITE(BMI160_REG_ACC_RANGE, ACC_RANGE_SETTING);
 
         // enable accel fast offset compensation,
         // x: 0g, y: 0g, z: 1g
@@ -2828,8 +2886,8 @@ static void accTestHandling(void)
         // set accel conf
         SPI_WRITE(BMI160_REG_ACC_CONF, 0x2c);
 
-        // set accel range to +-8g
-        SPI_WRITE(BMI160_REG_ACC_RANGE, 0x08);
+        // set accel range
+        SPI_WRITE(BMI160_REG_ACC_RANGE, ACC_RANGE_SETTING);
 
         // read stale accel data
         SPI_READ(BMI160_REG_DATA_14, 6, &mTask.dataBuffer);
@@ -3320,8 +3378,8 @@ static void sensorInit(void)
         mTask.sensors[GYR].offset_enable = false;
         SPI_WRITE(BMI160_REG_OFFSET_6, offset6Mode(), 450);
 
-        // initial range for accel (+-8g) and gyro (+-1000 degree).
-        SPI_WRITE(BMI160_REG_ACC_RANGE, 0x08, 450);
+        // initial range for accel and gyro (+-1000 degree).
+        SPI_WRITE(BMI160_REG_ACC_RANGE, ACC_RANGE_SETTING, 450);
         SPI_WRITE(BMI160_REG_GYR_RANGE, 0x01, 450);
 
         // Reset step counter
@@ -3434,6 +3492,7 @@ static void handleSpiDoneEvt(const void* evtData)
                 ERROR_PRINT("Couldn't get a timer to verify ID\n");
             break;
         } else {
+            INFO_PRINT("detected\n");
             SET_STATE(SENSOR_INITIALIZING);
             mTask.init_state = RESET_BMI160;
             sensorInit();
@@ -3572,6 +3631,69 @@ static void handleSpiDoneEvt(const void* evtData)
     }
 }
 
+#ifdef BMI160_USE_I2C
+static void i2cCallback(void *cookie, size_t tx, size_t rx, int err);
+
+/* delayed callback */
+static void i2cDelayCallback(uint32_t timerId, void *data)
+{
+    i2cCallback(data, 0, 0, 0);
+}
+
+static void i2cCallback(void *cookie, size_t tx, size_t rx, int err)
+{
+    TDECL();
+    uint8_t reg = T(cReg) - 1;
+    uint32_t delay;
+
+    if (err != 0) {
+        ERROR_PRINT("i2c error (tx: %d, rx: %d, err: %d)\n", tx, rx, err);
+    } else { /* delay callback if it is the case */
+        delay = T(packets[reg]).delay;
+        T(packets[reg]).delay = 0;
+        if (delay > 0) {
+            if (timTimerSet(delay, 0, 50, i2cDelayCallback, cookie, true))
+                return;
+            ERROR_PRINT("Cannot do delayed i2cCallback\n");
+            err = -ENOMEM;
+        }
+    }
+    i2cBatchTxRx(cookie, err);
+}
+
+static void i2cBatchTxRx(void *evtData, int err)
+{
+    TDECL();
+    uint8_t *txBuf;
+    uint8_t *rxBuf;
+    uint16_t size;
+    uint8_t reg;
+
+    reg = T(cReg)++;
+    if (err || (reg >= T(mRegCnt))) // No more packets
+        goto i2c_batch_end;
+
+    // Setup i2c op for next packet
+    txBuf = (uint8_t *)T(packets[reg]).txBuf;
+    size = T(packets[reg]).size;
+    if (txBuf[0] & BMI160_SPI_READ) { // Read op
+        rxBuf = (uint8_t *)T(packets[reg]).rxBuf + 1;
+        size--;
+        err = i2cMasterTxRx(BMI160_I2C_BUS_ID, BMI160_I2C_ADDR, txBuf, 1, rxBuf, size, i2cCallback, evtData);
+    } else { // Write op
+        err = i2cMasterTx(BMI160_I2C_BUS_ID, BMI160_I2C_ADDR, txBuf, size, i2cCallback, evtData);
+    }
+    if (!err)
+        return;
+    ERROR_PRINT("%s: [0x%x] (err: %d)\n", __func__, txBuf[0], err);
+
+i2c_batch_end:
+    T(mRegCnt) = 0;
+    if (T(sCallback))
+        T(sCallback)((void *)evtData, err);
+}
+#endif
+
 static void handleEvent(uint32_t evtType, const void* evtData)
 {
     TDECL();
@@ -3648,8 +3770,10 @@ static bool startTask(uint32_t task_id)
     T(tid) = task_id;
 
     T(Int1) = gpioRequest(BMI160_INT1_PIN);
+    T(Irq1) = BMI160_INT1_IRQ;
     T(Isr1).func = bmi160Isr1;
     T(Int2) = gpioRequest(BMI160_INT2_PIN);
+    T(Irq2) = BMI160_INT2_IRQ;
     T(Isr2).func = bmi160Isr2;
     T(pending_int[0]) = false;
     T(pending_int[1]) = false;
@@ -3670,7 +3794,11 @@ static bool startTask(uint32_t task_id)
 
     T(watermark) = 0;
 
+#ifdef BMI160_USE_I2C
+    i2cMasterRequest(BMI160_I2C_BUS_ID, BMI160_I2C_SPEED);
+#else
     spiMasterRequest(BMI160_SPI_BUS_ID, &T(spiDev));
+#endif
 
     for (i = FIRST_CONT_SENSOR; i < NUM_OF_SENSOR; i++) {
         initSensorStruct(&T(sensors[i]), i);
@@ -3764,6 +3892,9 @@ static bool startTask(uint32_t task_id)
     }
     T(mWbufCnt) = 0;
     T(mRegCnt) = 0;
+#ifdef BMI160_USE_I2C
+    T(cReg) = 0;
+#endif
     T(spiInUse) = false;
 
     T(interrupt_enable_0) = 0x00;
@@ -3775,8 +3906,8 @@ static bool startTask(uint32_t task_id)
     T(frame_sensortime) = ULONG_LONG_MAX;
 
     // it's ok to leave interrupt open all the time.
-    enableInterrupt(T(Int1), &T(Isr1));
-    enableInterrupt(T(Int2), &T(Isr2));
+    enableInterrupt(T(Int1), T(Irq1), &T(Isr1));
+    enableInterrupt(T(Int2), T(Irq2), &T(Isr2));
 
     return true;
 }
@@ -3791,11 +3922,13 @@ static void endTask(void)
     accelCalDestroy(&mTask.acc);
 #endif
     slabAllocatorDestroy(T(mDataSlab));
+#ifndef BMI160_USE_I2C
     spiMasterRelease(mTask.spiDev);
+#endif
 
     // disable and release interrupt.
-    disableInterrupt(mTask.Int1, &mTask.Isr1);
-    disableInterrupt(mTask.Int2, &mTask.Isr2);
+    disableInterrupt(mTask.Int1, mTask.Irq1, &mTask.Isr1);
+    disableInterrupt(mTask.Int2, mTask.Irq2, &mTask.Isr2);
     gpioRelease(mTask.Int1);
     gpioRelease(mTask.Int2);
 }

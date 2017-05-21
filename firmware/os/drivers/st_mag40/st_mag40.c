@@ -198,7 +198,6 @@ struct I2cTransfer
     size_t rx;
     int err;
     uint8_t txrxBuf[ST_MAG40_MAX_I2C_TRANSFER_SIZE];
-    uint8_t state;
     bool last;
     bool inUse;
     uint32_t delay;
@@ -309,7 +308,6 @@ static struct I2cTransfer *allocXfer(void)
     for (i = 0; i < ARRAY_SIZE(mTask.transfers); i++) {
         if (!mTask.transfers[i].inUse) {
             mTask.transfers[i].inUse = true;
-            mTask.transfers[i].state = GET_STATE();
             return &mTask.transfers[i];
         }
     }
@@ -460,7 +458,7 @@ static const struct SensorInfo st_mag40_SensorInfo =
 /* Sensor Operations */
 static bool magPower(bool on, void *cookie)
 {
-    DEBUG_PRINT("magPower %s\n", on ? "on" : "off");
+    INFO_PRINT("magPower %s\n", on ? "on" : "off");
     if (trySwitchState(SENSOR_MAG_CONFIGURATION)) {
         mTask.subState = on ? CONFIG_POWER_UP : CONFIG_POWER_DOWN;
         sensorMagConfig();
@@ -480,7 +478,8 @@ static bool magSetRate(uint32_t rate, uint64_t latency, void *cookie)
 {
     uint8_t num = 0;
 
-    DEBUG_PRINT("magSetRate %lu\n", rate);
+    INFO_PRINT("magSetRate %lu Hz - %llu ns\n", rate, latency);
+
     num = st_mag40_computeOdr(rate);
     mTask.currentODR = st_mag40_regVal[num];
     mTask.rate = rate;
@@ -498,7 +497,7 @@ static bool magSetRate(uint32_t rate, uint64_t latency, void *cookie)
 
 static bool magFlush(void *cookie)
 {
-    DEBUG_PRINT("magFlush\n");
+    INFO_PRINT("magFlush\n");
     return osEnqueueEvt(sensorGetMyEventType(SENS_TYPE_MAG), SENSOR_DATA_EVENT_FLUSH, NULL);
 }
 
@@ -613,7 +612,7 @@ static void magTestHandling(struct I2cTransfer *xfer)
 
 static bool magSelfTest(void *cookie)
 {
-    DEBUG_PRINT("magSelfTest\n");
+    INFO_PRINT("magSelfTest\n");
 
     if (!mTask.magOn && trySwitchState(SENSOR_SELF_TEST)) {
         mTask.mag_test_state = MAG_SELFTEST_INIT;
@@ -842,7 +841,7 @@ static void handleCommDoneEvt(const void* evtData)
     bool returnIdle = false;
     struct I2cTransfer *xfer = (struct I2cTransfer *)evtData;
 
-    switch (xfer->state) {
+    switch (GET_STATE()) {
     case SENSOR_BOOT:
         SET_STATE(SENSOR_VERIFY_ID);
 

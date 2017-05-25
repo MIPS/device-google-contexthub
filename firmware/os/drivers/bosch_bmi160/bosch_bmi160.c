@@ -1,4 +1,3 @@
-
 /*
  * Copyright (C) 2016 The Android Open Source Project
  *
@@ -287,7 +286,8 @@
 #define MAG_MAX_RATE    11
 #define ACC_MAX_OSR     3
 #define GYR_MAX_OSR     4
-#define OSR_THRESHOLD   8
+#define ODR_100HZ       8
+#define ODR_200HZ       9
 
 #define MOTION_ODR         7
 
@@ -457,6 +457,7 @@ struct OtcGyroUpdateBuffer {
     struct AppToSensorHalDataBuffer head;
     struct GyroOtcData data;
     volatile uint8_t lock; // lock for static object
+    bool sendToHostRequest;
 } __attribute__((packed));
 
 struct BMI160Task {
@@ -1594,6 +1595,7 @@ static bool accSetRate(uint32_t rate, uint64_t latency, void *cookie)
 {
     TDECL();
     int odr, osr = 0;
+    int osr_mode = 2; // normal
 
     // change this to DEBUG_PRINT as there will be frequent (un)subscribings
     // to accel with different rate/latency requirements.
@@ -1618,7 +1620,13 @@ static bool accSetRate(uint32_t rate, uint64_t latency, void *cookie)
 
         // for high odrs, oversample to reduce hw latency and downsample
         // to get desired odr
-        if (odr > OSR_THRESHOLD) {
+        if (odr > ODR_100HZ) {
+            // 200Hz osr4, >= 400Hz osr2
+            if (odr == ODR_200HZ) {
+                osr_mode = 0; // OSR4
+            } else {
+                osr_mode = 1; // OSR2
+            }
             osr = (ACC_MAX_OSR + odr) > ACC_MAX_RATE ? (ACC_MAX_RATE - odr) : ACC_MAX_OSR;
             odr += osr;
         }
@@ -1633,7 +1641,7 @@ static bool accSetRate(uint32_t rate, uint64_t latency, void *cookie)
 
         // set ACC bandwidth parameter to 2 (bits[4:6])
         // set the rate (bits[0:3])
-        SPI_WRITE(BMI160_REG_ACC_CONF, 0x20 | odr);
+        SPI_WRITE(BMI160_REG_ACC_CONF, (osr_mode << 4) | odr);
 
         // configure down sampling ratio, 0x88 is to specify we are using
         // filtered samples
@@ -1656,6 +1664,7 @@ static bool gyrSetRate(uint32_t rate, uint64_t latency, void *cookie)
 {
     TDECL();
     int odr, osr = 0;
+    int osr_mode = 2; // normal
     INFO_PRINT("gyrSetRate: rate=%ld, latency=%lld, state=%" PRI_STATE "\n",
                rate, latency, getStateName(GET_STATE()));
 
@@ -1677,7 +1686,13 @@ static bool gyrSetRate(uint32_t rate, uint64_t latency, void *cookie)
 
         // for high odrs, oversample to reduce hw latency and downsample
         // to get desired odr
-        if (odr > OSR_THRESHOLD) {
+        if (odr > ODR_100HZ) {
+            // 200Hz osr4, >= 400Hz osr2
+            if (odr == ODR_200HZ) {
+                osr_mode = 0; // OSR4
+            } else {
+                osr_mode = 1; // OSR2
+            }
             osr = (GYR_MAX_OSR + odr) > GYR_MAX_RATE ? (GYR_MAX_RATE - odr) : GYR_MAX_OSR;
             odr += osr;
         }
@@ -1689,7 +1704,7 @@ static bool gyrSetRate(uint32_t rate, uint64_t latency, void *cookie)
 
         // set GYR bandwidth parameter to 2 (bits[4:6])
         // set the rate (bits[0:3])
-        SPI_WRITE(BMI160_REG_GYR_CONF, 0x20 | odr);
+        SPI_WRITE(BMI160_REG_GYR_CONF, (osr_mode << 4) | odr);
 
         // configure down sampling ratio, 0x88 is to specify we are using
         // filtered samples
@@ -2246,7 +2261,7 @@ static void parseRawData(struct BMI160Sensor *mSensor, uint8_t *buf, float kScal
       if (overTempCalNewModelUpdateAvailable(&mTask.over_temp_gyro_cal)
           || new_otc_offset_update) {
         // Notify HAL to store new gyro OTC-Gyro data.
-        sendOtcGyroUpdate();
+        T(otcGyroUpdateBuffer).sendToHostRequest = true;
       }
 #endif  // OVERTEMPCAL_ENABLED
     }
@@ -3201,8 +3216,9 @@ static bool magCfgData(void *data, void *cookie)
                 (int)(d->inclination * 180 / M_PI + 0.5f));
 
         // Passing local field information to mag calibration routine
+#ifdef DIVERSITY_CHECK_ENABLED
         diversityCheckerLocalFieldUpdate(&mTask.moc.diversity_checker, d->strength);
-
+#endif
         // TODO: pass local field information to rotation vector sensor.
     } else {
         ERROR_PRINT("magCfgData: unknown type 0x%04x, size %d", p->type, p->size);
@@ -3323,6 +3339,13 @@ static void processPendingEvt(void)
         mTask.pending_calibration_save = !saveCalibration();
         return;
     }
+
+#ifdef OVERTEMPCAL_ENABLED
+    // tasks that do not initiate SPI transaction
+    if (T(otcGyroUpdateBuffer).sendToHostRequest) {
+        sendOtcGyroUpdate();
+    }
+#endif
 }
 
 static void sensorInit(void)
@@ -4285,6 +4308,7 @@ static bool sendOtcGyroUpdate_(TASK) {
         if (osEnqueueEvtOrFree(EVT_APP_TO_SENSOR_HAL_DATA, // bit-or EVENT_TYPE_BIT_DISCARDABLE
                                                           // to make event discardable
                                p, unlockOtcGyroUpdateBuffer)) {
+            T(otcGyroUpdateBuffer).sendToHostRequest = false;
             ++step;
         }
     }

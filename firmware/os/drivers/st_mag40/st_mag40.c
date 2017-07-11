@@ -215,6 +215,7 @@ struct st_mag40_Task {
     uint8_t subState;
 
     /* sensor flags */
+    uint8_t samplesToDiscard;
     uint32_t rate;
     uint64_t latency;
     bool magOn;
@@ -484,6 +485,7 @@ static bool magSetRate(uint32_t rate, uint64_t latency, void *cookie)
     mTask.currentODR = st_mag40_regVal[num];
     mTask.rate = rate;
     mTask.latency = latency;
+    mTask.samplesToDiscard = 2;
 
     if (trySwitchState(SENSOR_MAG_CONFIGURATION)) {
         mTask.subState = CONFIG_SET_RATE;
@@ -699,6 +701,12 @@ static void parseRawData(uint8_t *raw)
     float xi, yi, zi;
 #endif
 
+	/* Discard samples generated during sensor turn-on time */
+    if (mTask.samplesToDiscard > 0) {
+        mTask.samplesToDiscard--;
+        return;
+    }
+
     /* in uT */
     xs = (float)raw_x * kScale_mag;
     ys = (float)raw_y * kScale_mag;
@@ -781,6 +789,7 @@ static void sensorMagConfig(void)
     switch (mTask.subState) {
     case CONFIG_POWER_UP:
         mTask.subState = CONFIG_POWER_UP_2;
+        mTask.comm_tx(ST_MAG40_CFG_B_REG_ADDR, ST_MAG40_OFF_CANC, 0, false);
         mTask.comm_tx(ST_MAG40_CFG_A_REG_ADDR,
                       ST_MAG40_TEMP_COMP_EN | ST_MAG40_POWER_ON | mTask.currentODR, 0, true);
         break;
@@ -838,6 +847,7 @@ static void sensorInit(void)
 
     case INIT_ENABLE_DRDY:
         mTask.subState = INIT_DONE;
+        mTask.comm_rx(ST_MAG40_OUTXL_REG_ADDR, 6, 0, false);
         mTask.comm_tx(ST_MAG40_CFG_C_REG_ADDR,
                     ST_MAG40_BDU_ON | ST_MAG40_INT_MAG, 0, true);
         break;
@@ -883,6 +893,7 @@ static void handleCommDoneEvt(const void* evtData)
 
     case SENSOR_INITIALIZATION:
         if (mTask.subState == INIT_DONE) {
+            INFO_PRINT( "Initialization completed\n");
             returnIdle = true;
             sensorRegisterInitComplete(mTask.magHandle);
         } else {
